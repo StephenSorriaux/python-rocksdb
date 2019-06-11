@@ -2150,6 +2150,139 @@ cdef class DB(object):
         if copts:
             copts.in_use = False
 
+@cython.no_gc_clear
+cdef class DBWithTTL(DB):
+    cdef Options opts
+    cdef db.DBWithTTL* db
+    cdef list cf_handles
+    cdef list cf_options
+
+    def __cinit__(self, db_name, Options opts, dict column_families=None, read_only=False, ttl=0):
+        cdef Status st
+        cdef string db_path
+        cdef vector[db.ColumnFamilyDescriptor] column_family_descriptors
+        cdef vector[db.ColumnFamilyHandle*] column_family_handles
+        cdef vector[int32_t] ttls
+        cdef bytes default_cf_name = db.kDefaultColumnFamilyName
+        self.db = NULL
+        self.opts = None
+        self.cf_handles = []
+        self.cf_options = []
+
+        if opts.in_use:
+            raise Exception("Options object is already used by another DB")
+
+        db_path = path_to_string(db_name)
+        if not column_families or default_cf_name not in column_families:
+            # Always add the default column family
+            column_family_descriptors.push_back(
+                db.ColumnFamilyDescriptor(
+                    db.kDefaultColumnFamilyName,
+                    options.ColumnFamilyOptions(deref(opts.opts))
+                )
+            )
+            self.cf_options.append(None)  # Since they are the same as db
+        if column_families:
+            for cf_name, cf_options in column_families.items():
+                if not isinstance(cf_name, bytes):
+                    raise TypeError(
+                        f"column family name {cf_name!r} is not of type {bytes}!"
+                    )
+                if not isinstance(cf_options, ColumnFamilyOptions):
+                    raise TypeError(
+                        f"column family options {cf_options!r} is not of type "
+                        f"{ColumnFamilyOptions}!"
+                    )
+                if (<ColumnFamilyOptions>cf_options).in_use:
+                    raise Exception(
+                        f"ColumnFamilyOptions object for {cf_name} is already "
+                        "used by another Column Family"
+                    )
+                (<ColumnFamilyOptions>cf_options).in_use = True
+                column_family_descriptors.push_back(
+                    db.ColumnFamilyDescriptor(
+                        cf_name,
+                        deref((<ColumnFamilyOptions>cf_options).copts)
+                    )
+                )
+                self.cf_options.append(cf_options)
+        if read_only:
+            with nogil:
+                st = db.DB_OpenForReadOnly_ColumnFamilies(
+                    deref(opts.opts),
+                    db_path,
+                    column_family_descriptors,
+                    &column_family_handles,
+                    &self.db,
+                    False)
+        else:
+            with nogil:
+                st = db.DB_Open_ColumnFamilies(
+                    deref(opts.opts),
+                    db_path,
+                    column_family_descriptors,
+                    &column_family_handles,
+                    &self.db)
+        check_status(st)
+
+        for handle in column_family_handles:
+            wrapper = _ColumnFamilyHandle.from_handle_ptr(handle)
+            self.cf_handles.append(wrapper)
+
+        # Inject the loggers into the python callbacks
+        cdef shared_ptr[logger.Logger] info_log = self.db.GetOptions(
+            self.db.DefaultColumnFamily()).info_log
+        if opts.py_comparator is not None:
+            opts.py_comparator.set_info_log(info_log)
+
+        if opts.py_table_factory is not None:
+            opts.py_table_factory.set_info_log(info_log)
+
+        if opts.prefix_extractor is not None:
+            opts.py_prefix_extractor.set_info_log(info_log)
+
+        cdef ColumnFamilyOptions copts
+        for idx, copts in enumerate(self.cf_options):
+            if not copts:
+                continue
+
+            info_log = self.db.GetOptions(column_family_handles[idx]).info_log
+
+            if copts.py_comparator is not None:
+                copts.py_comparator.set_info_log(info_log)
+
+            if copts.py_table_factory is not None:
+                copts.py_table_factory.set_info_log(info_log)
+
+            if copts.prefix_extractor is not None:
+                copts.py_prefix_extractor.set_info_log(info_log)
+
+        self.opts = opts
+        self.opts.in_use = True
+
+    def create_column_family_with_ttl(self, bytes name, ColumnFamilyOptions copts, int ttl):
+        cdef db.ColumnFamilyHandle* cf_handle
+        cdef Status st
+        cdef string c_name = name
+        cdef int c_ttl = ttl
+
+        for handle in self.cf_handles:
+            if handle.name == name:
+                raise ValueError(f"{name} is already an existing column family")
+
+        if copts.in_use:
+            raise Exception("ColumnFamilyOptions are in_use by another column family")
+
+        copts.in_use = True
+        with nogil:
+            st = self.db.CreateColumnFamilyWithTTL(deref(copts.copts), c_name, &cf_handle, c_ttl)
+        check_status(st)
+
+        handle = _ColumnFamilyHandle.from_handle_ptr(cf_handle)
+
+        self.cf_handles.append(handle)
+        self.cf_options.append(copts)
+        return handle.weakref
 
 def repair_db(db_name, Options opts):
     cdef Status st
